@@ -6,11 +6,12 @@
  * "Skill module not enabled"），修复前该响应被原样透传，导致即便是**没有任何 skill**
  * 的 agent 也无法删除（永远走不到 meta/agent/archive）。
  *
- * 覆盖四组行为：
- *   1. 能力缺失 → 视为空 skill 集合，继续 archive（不调 skill/delete）；
+ * 覆盖五组行为：
+ *   1. 能力缺失（首页命中）→ 视为空 skill 集合，继续 archive（不调 skill/delete）；
  *   2. fail-closed → 其它 404 / list 错误一律原样透传，绝不 archive；
- *   3. 正常路径 → skill 全部删除成功后才 archive，顺序与删除清单正确；
- *   4. delete 失败 → 中断且不 archive，错误里带失败 skill_id 与已删清单。
+ *   3. 分页边界 → 分页中途才回能力缺失属自相矛盾响应，同样 fail-closed；
+ *   4. 正常路径 → skill 全部删除成功后才 archive，顺序与删除清单正确；
+ *   5. delete 失败 → 中断且不 archive，错误里带失败 skill_id 与已删清单。
  *
  * 测试方式：不启 HTTP server，直接把路由挂到独立 Hono app 上，用最小 fake deps
  * （meta/skill 两个 kernel port）驱动，并用 timeline 断言内核调用的**先后顺序**——
@@ -217,6 +218,32 @@ describe('delete-cascade · SkillCore 未启用（issue #1218 回归）', () => 
     expect(status).toBe(200);
     expect((body.data as DeleteCascadeData).archived).toBe(true);
     expect(harness.timeline).toContain('meta:agent/archive');
+  });
+
+  it('分页已开始后才回能力缺失 → 视为自相矛盾响应，保持 fail-closed', async () => {
+    // 场景来自同仓 #1219 评审中指出的分页边界：能力缺失是**模块级**属性，不可能
+    // 第一页正常返回 100 条、翻到第二页才说模块未启用。若按空集合继续归档，第 101
+    // 条 skill 既不会被列出也不会被删除，会变成孤儿 active skill —— 恰好违背本路由
+    // 的存在意义。因此这里必须原样透传错误，不删任何 skill、不 archive。
+    const firstPage: SkillRow[] = Array.from({ length: 100 }, (_, i) => ({
+      skill_id: `skill-${i + 1}`,
+      version: 1,
+    }));
+    const harness = createHarness({
+      list: ({ index }) =>
+        index === 0
+          ? envelope(0, 'ok', { items: firstPage, total: firstPage.length + 1 })
+          : envelope(SKILL_MODULE_DISABLED_CODE, SKILL_MODULE_DISABLED_MESSAGE, null),
+    });
+
+    const { status, body } = await deleteCascade(harness);
+
+    expect(status).toBe(404);
+    expect(body.code).toBe(SKILL_MODULE_DISABLED_CODE);
+    expect(body.message).toBe(SKILL_MODULE_DISABLED_MESSAGE);
+    expect(harness.listOffsets).toEqual([0, 100]);
+    expect(harness.requestedDeleteIds).toEqual([]);
+    expect(harness.timeline).not.toContain('meta:agent/archive');
   });
 });
 
